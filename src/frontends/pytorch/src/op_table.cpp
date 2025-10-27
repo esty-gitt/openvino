@@ -246,6 +246,8 @@ OP_CONVERTER(translate_shape_as_tensor);
 OP_CONVERTER(translate_sign);
 OP_CONVERTER(translate_size);
 OP_CONVERTER(translate_slice);
+OP_CONVERTER(translate_smooth_l1_loss);
+OP_CONVERTER(translate_smooth_l1_loss_fx);
 OP_CONVERTER(translate_softmax);
 OP_CONVERTER(translate_sort);
 OP_CONVERTER(translate_split_with_sizes);
@@ -716,6 +718,8 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_ts() {
         {"aten::sinh_", op::inplace_op<op::translate_1to1_match_1_inputs<opset10::Sinh>>},
         {"aten::size", op::translate_size},
         {"aten::slice", op::quantizable_op<op::translate_slice>},
+        {"aten::smooth_l1_loss", op::translate_smooth_l1_loss},
+        {"aten.smooth_l1_loss.default", op::translate_smooth_l1_loss_fx},
         {"aten::softmax", op::translate_softmax},
         {"aten::softplus", op::translate_1to1_match_1_inputs<opset10::SoftPlus>},
         {"aten::sort", op::translate_sort},
