@@ -1,18 +1,19 @@
 // Copyright (C) 2018-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-
-#include "openvino/op/constant.hpp"
-#include "openvino/op/convert.hpp"
-#include "openvino/op/convert_like.hpp"
-#include "openvino/op/subtract.hpp"
-#include "openvino/op/abs.hpp"
-#include "openvino/op/less.hpp"
-#include "openvino/op/multiply.hpp"
-#include "openvino/op/select.hpp"
-#include "openvino/op/reduce_mean.hpp"
-#include "openvino/op/reduce_sum.hpp"
+//
+#include <cmath>
 
 #include "openvino/frontend/pytorch/node_context.hpp"
+#include "openvino/op/abs.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/convert_like.hpp"
+#include "openvino/op/divide.hpp"
+#include "openvino/op/less.hpp"
+#include "openvino/op/multiply.hpp"
+#include "openvino/op/reduce_mean.hpp"
+#include "openvino/op/reduce_sum.hpp"
+#include "openvino/op/select.hpp"
+#include "openvino/op/subtract.hpp"
 #include "utils.hpp"
 
 namespace ov {
@@ -22,71 +23,130 @@ namespace op {
 
 using namespace ov::op;
 
+// aten::smooth_l1_loss translator (PyTorch semantics):
+// piecewise: |x| < beta ? 0.5*x^2/beta : |x| - 0.5*beta; L1 fallback if beta≈0
+// DType: ConvertLike(target,input) and for scalars; reductions via get_axes_range; mark_node everywhere
 OutputVector translate_smooth_l1_loss(const NodeContext& node) {
-    // Get inputs: input (predictions) and target (ground truth)
+    // Inputs
     auto input = node.get_input(0);
     auto target = node.get_input(1);
 
-    // Get attributes with defaults matching PyTorch
-    auto reduction = node.get_attribute<std::string>("reduction", "mean");
-    auto beta = node.get_attribute<float>("beta", 1.0);
+    // Early dtype alignment
+    target = node.mark_node(std::make_shared<v1::ConvertLike>(target, input));
+    align_eltwise_input_types(node, input, target);
+    auto a = input;
+    auto b = target;
 
-    // Create constants with input's element type
-    auto beta_const = v0::Constant::create(input.get_element_type(), Shape{}, {beta});
-    auto half = v0::Constant::create(input.get_element_type(), Shape{}, {0.5f});
-    auto beta_reciprocal = v0::Constant::create(input.get_element_type(), Shape{}, {1.0f / beta});
+    // Scalar constants (f32 -> ConvertLike)
+    auto c05 = v0::Constant::create(element::f32, Shape{}, {0.5f});
+    auto c05_like = node.mark_node(std::make_shared<v1::ConvertLike>(c05, a));
+    auto eps = v0::Constant::create(element::f32, Shape{}, {1e-5f});
+    auto eps_like = node.mark_node(std::make_shared<v1::ConvertLike>(eps, a));
 
-    // Calculate |input - target|
-    auto diff = std::make_shared<v1::Subtract>(input, target);
-    auto abs_diff = std::make_shared<v0::Abs>(diff);
-
-    // Calculate smooth L1 loss:
-    // L = 0.5 * (x)^2 / beta,     if |x| < beta
-    // L = |x| - 0.5 * beta,       if |x| >= beta
-
-    // Create mask for |x| < beta
-    auto less_mask = std::make_shared<v1::Less>(abs_diff, beta_const);
-
-    // Calculate quadratic term: 0.5 * (x)^2 / beta
-    auto squared_diff = std::make_shared<v1::Multiply>(diff, diff);
-    auto quad_term = std::make_shared<v1::Multiply>(
-        std::make_shared<v1::Multiply>(half, squared_diff),
-        beta_reciprocal);
-
-    // Calculate linear term: |x| - 0.5 * beta
-    auto half_beta = std::make_shared<v1::Multiply>(half, beta_const);
-    auto linear_term = std::make_shared<v1::Subtract>(abs_diff, half_beta);
-
-    // Select between quadratic and linear terms based on mask
-    auto loss = std::make_shared<v1::Select>(less_mask, quad_term, linear_term);
-
-    // Apply reduction
-    if (reduction == "none") {
-        return {loss};
-    } else if (reduction == "mean") {
-        // Create axes for reduction (reduce all dimensions)
-        std::vector<int64_t> axes;
-        for (size_t i = 0; i < input.get_shape().size(); ++i) {
-            axes.push_back(i);
-        }
-        auto axes_const = v0::Constant::create(element::i64, Shape{axes.size()}, axes);
-        return {std::make_shared<v1::ReduceMean>(loss, axes_const, false)};
-    } else { // sum
-        // Create axes for reduction (reduce all dimensions)
-        std::vector<int64_t> axes;
-        for (size_t i = 0; i < input.get_shape().size(); ++i) {
-            axes.push_back(i);
-        }
-        auto axes_const = v0::Constant::create(element::i64, Shape{axes.size()}, axes);
-        return {std::make_shared<v1::ReduceSum>(loss, axes_const, false)};
+    // beta: input[3] (FX) or attribute (TS)
+    ov::Output<ov::Node> beta_like;
+    if (node.get_input_size() > 3 && !node.input_is_none(3)) {
+        beta_like = node.mark_node(std::make_shared<v1::ConvertLike>(node.get_input(3), a));
+    } else {
+        float beta_attr = node.get_attribute<float>("beta", 1.0f);
+        OPENVINO_ASSERT(beta_attr >= 0.f, "smooth_l1_loss: beta must be non-negative");
+        beta_like = node.mark_node(std::make_shared<v1::ConvertLike>(v0::Constant::create(element::f32, Shape{}, {beta_attr}), a));
     }
+
+    // Per-element computation
+    auto diff = node.mark_node(std::make_shared<v1::Subtract>(a, b));
+    auto l1 = node.mark_node(std::make_shared<v0::Abs>(diff));
+    auto is_small = node.mark_node(std::make_shared<v1::Less>(
+        node.mark_node(std::make_shared<v0::Abs>(beta_like)),
+        eps_like));
+
+    // quad = 0.5 * diff^2 / beta
+    auto diff_sq = node.mark_node(std::make_shared<v1::Multiply>(diff, diff));
+    auto quad_num = node.mark_node(std::make_shared<v1::Multiply>(c05_like, diff_sq));
+    auto quad = node.mark_node(std::make_shared<v1::Divide>(quad_num, beta_like));
+    // lin = |x| - 0.5 * beta
+    auto lin = node.mark_node(std::make_shared<v1::Subtract>(l1, node.mark_node(std::make_shared<v1::Multiply>(c05_like, beta_like))));
+
+    auto elem = node.mark_node(std::make_shared<v1::Select>(
+        node.mark_node(std::make_shared<v1::Less>(l1, beta_like)),
+        quad,
+        lin));
+    auto safe = node.mark_node(std::make_shared<v1::Select>(is_small, l1, elem));
+
+    // Reduction (0/1/2 -> none/mean/sum) or attribute
+    std::string reduction = "mean";
+    if (node.get_input_size() > 2 && !node.input_is_none(2)) {
+        auto red_input = node.get_input(2);
+        if (auto red_const = std::dynamic_pointer_cast<v0::Constant>(red_input.get_node_shared_ptr())) {
+            int64_t red_val = 1;
+            if (red_const->get_element_type().is_integral_number()) {
+                red_val = red_const->cast_vector<int64_t>()[0];
+            }
+            reduction = (red_val == 0) ? "none" : (red_val == 1) ? "mean" : (red_val == 2) ? "sum" : reduction;
+        }
+    } else {
+        reduction = node.get_attribute<std::string>("reduction", "mean");
+    }
+
+    if (reduction == "none") {
+        auto out = node.mark_node(std::make_shared<v1::ConvertLike>(safe, a));
+        return {out->output(0)};
+    }
+
+    auto axes = get_axes_range(node, 0);
+    if (reduction == "mean") {
+        auto out = node.mark_node(std::make_shared<v1::ReduceMean>(safe, axes, false));
+        out = node.mark_node(std::make_shared<v1::ConvertLike>(out, a));
+        return {out->output(0)};
+    }
+    auto out = node.mark_node(std::make_shared<v1::ReduceSum>(safe, axes, false));
+    out = node.mark_node(std::make_shared<v1::ConvertLike>(out, a));
+    return { out->output(0) };
 }
 
+// FX wrapper
 OutputVector translate_smooth_l1_loss_fx(const NodeContext& node) {
     return translate_smooth_l1_loss(node);
 }
 
-} // namespace op
-} // namespace pytorch
-} // namespace frontend
-} // namespace ov
+// aten::l1_loss translator (mean/none/sum)
+OutputVector translate_l1_loss(const NodeContext& node) {
+    auto a = node.get_input(0);
+    auto b = node.get_input(1);
+    align_eltwise_input_types(node, a, b);
+
+    // reduction parse
+    auto reduction = std::string{"mean"};
+    if (node.get_input_size() > 2 && !node.input_is_none(2)) {
+        auto red_input = node.get_input(2);
+        if (auto red_const = std::dynamic_pointer_cast<v0::Constant>(red_input.get_node_shared_ptr())) {
+            int64_t red_val = 1;
+            if (red_const->get_element_type().is_integral_number()) {
+                red_val = red_const->cast_vector<int64_t>()[0];
+            }
+            reduction = (red_val == 0) ? "none" : (red_val == 1) ? "mean" : (red_val == 2) ? "sum" : reduction;
+        }
+    } else {
+        reduction = node.get_attribute<std::string>("reduction", "mean");
+    }
+
+    auto abs_diff = node.mark_node(std::make_shared<v0::Abs>(node.mark_node(std::make_shared<v1::Subtract>(a, b))));
+    std::shared_ptr<ov::Node> out = abs_diff;
+    if (reduction == "mean") {
+        out = node.mark_node(std::make_shared<v1::ReduceMean>(out, get_axes_range(node, 0), false));
+    } else if (reduction == "sum") {
+        out = node.mark_node(std::make_shared<v1::ReduceSum>(out, get_axes_range(node, 0), false));
+    }
+    out = node.mark_node(std::make_shared<v1::ConvertLike>(out, a));
+    return {out->output(0)};
+}
+
+// FX wrapper
+OutputVector translate_l1_loss_fx(const NodeContext& node) {
+    return translate_l1_loss(node);
+}
+
+}  // namespace op
+}  // namespace pytorch
+}  // namespace frontend
+}  // namespace ov

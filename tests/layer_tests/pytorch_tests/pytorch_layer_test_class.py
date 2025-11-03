@@ -173,6 +173,44 @@ class PytorchLayerTest:
             flatten_fw_res = []
 
             flatten_fw_res = flattenize_outputs(fw_res)
+            
+            # === BEGIN: explicit PyTorch vs OpenVINO print for loss ===
+        def _to_scalar_or_array(v):
+            # הופך טנזור/ndarray/סקאלר למספר בודד אם זה גודל 1 — אחרת נשאר ndarray לקריאות
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            a = np.array(v)
+            return a.reshape(()).item() if a.size == 1 else a
+
+        # ננסה לקרוא פרמטרים מהמארח (אם זה המודל שלך עם self.reduction/self.beta)
+        reduction_dbg = getattr(smodel, "reduction", None)
+        beta_dbg = getattr(smodel, "beta", None)
+
+        print("----- PyTorch vs OpenVINO (debug, per output) -----")
+        for i in range(len(output_list)):
+            fw_item = flatten_fw_res[i]
+            ov_item = infer_res[compiled.output(i)]
+
+            fw_val = _to_scalar_or_array(fw_item)
+            ov_val = _to_scalar_or_array(ov_item)
+
+            hdr = f"[out#{i}]"
+            if reduction_dbg is not None:
+                hdr += f" reduction={reduction_dbg}"
+            if beta_dbg is not None:
+                hdr += f" beta={beta_dbg}"
+
+            print(hdr)
+            print(f"  PyTorch:  {fw_val}")
+            print(f"  OpenVINO: {ov_val}")
+
+            # אם זה סקאלרים (כמו loss עם reduction='mean') — נדפיס גם הפרשים
+            if isinstance(fw_val, (int, float, np.floating)) and isinstance(ov_val, (int, float, np.floating)):
+                abs_err = float(np.abs(ov_val - fw_val))
+                rel_err = float(abs_err / (np.abs(fw_val) + 1e-12))
+                print(f"  abs_err={abs_err:.6g}  rel_err={rel_err:.6g}")
+            print("----------------------------------------------------")
+# === END: explicit PyTorch vs OpenVINO print for loss ===
 
             assert len(flatten_fw_res) == len(
                 output_list), f'number of outputs not equal, {len(flatten_fw_res)} != {len(output_list)}'
