@@ -142,6 +142,7 @@ OP_CONVERTER(translate_inverse);
 OP_CONVERTER(translate_istft);
 OP_CONVERTER(translate_is_nonzero);
 OP_CONVERTER(translate_kthvalue);
+OP_CONVERTER(translate_l1_loss);
 OP_CONVERTER(translate_layer_norm);
 OP_CONVERTER(translate_len);
 OP_CONVERTER(translate_lerp);
@@ -247,9 +248,6 @@ OP_CONVERTER(translate_sign);
 OP_CONVERTER(translate_size);
 OP_CONVERTER(translate_slice);
 OP_CONVERTER(translate_smooth_l1_loss);
-OP_CONVERTER(translate_smooth_l1_loss_fx);
-OP_CONVERTER(translate_l1_loss);
-OP_CONVERTER(translate_l1_loss_fx);
 OP_CONVERTER(translate_softmax);
 OP_CONVERTER(translate_sort);
 OP_CONVERTER(translate_split_with_sizes);
@@ -320,6 +318,7 @@ OP_CONVERTER(translate_full_like_fx);
 OP_CONVERTER(translate_gelu_fx);
 OP_CONVERTER(translate_group_norm_fx);
 OP_CONVERTER(translate_index_fx);
+OP_CONVERTER(translate_l1_loss_fx);
 OP_CONVERTER(translate_layer_norm_fx);
 OP_CONVERTER(translate_leaky_relu_fx);
 OP_CONVERTER(translate_log_sigmoid_fx);
@@ -343,6 +342,7 @@ OP_CONVERTER(translate_search_sorted);
 OP_CONVERTER(translate_select_scatter_fx);
 OP_CONVERTER(translate_slice_fx);
 OP_CONVERTER(translate_slice_scatter_fx);
+OP_CONVERTER(translate_smooth_l1_loss_fx);
 OP_CONVERTER(translate_softmax_fx);
 OP_CONVERTER(translate_sort_fx);
 OP_CONVERTER(translate_stack_fx);
@@ -575,6 +575,7 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_ts() {
         {"aten::isinf", op::translate_1to1_match_1_inputs<opset10::IsInf>},
         {"aten::isnan", op::translate_1to1_match_1_inputs<opset10::IsNaN>},
         {"aten::item", op::translate_1to1_match_1_inputs<opset10::Squeeze>},
+        {"aten::l1_loss", op::translate_l1_loss},
         {"aten::layer_norm", op::translate_layer_norm},
         {"aten::le", op::translate_1to1_match_2_inputs_align_types<opset10::LessEqual>},
         {"aten::leaky_relu", op::translate_1to1_match_2_inputs<opset10::PRelu>},
@@ -721,10 +722,15 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_ts() {
         {"aten::size", op::translate_size},
         {"aten::slice", op::quantizable_op<op::translate_slice>},
         {"aten::smooth_l1_loss", op::translate_smooth_l1_loss},
-        {"aten::l1_loss", op::translate_l1_loss},
         {"aten::softmax", op::translate_softmax},
+        {"aten::softplus", op::translate_1to1_match_1_inputs<opset10::SoftPlus>},
         {"aten::sort", op::translate_sort},
+        {"aten::special_expit",
+         op::optional_out<op::translate_1to1_match_1_inputs_with_fp32_type_alignment<opset10::Sigmoid>, 1>},
+        // aten::split - Supported in limited set of patterns
         {"aten::split_with_sizes", op::translate_split_with_sizes},
+        {"aten::sqrt", op::optional_out<op::translate_1to1_match_1_inputs_with_fp32_type_alignment<opset10::Sqrt>, 1>},
+        {"aten::sqrt_", op::inplace_op<op::translate_1to1_match_1_inputs_with_fp32_type_alignment<opset10::Sqrt>>},
         {"aten::square", op::translate_square},
         {"aten::squeeze", op::quantizable_op<op::translate_squeeze>},
         // aten::stack - Supported in limited set of patterns
@@ -883,9 +889,7 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_fx() {
         {"aten.atan2.default", op::translate_atan2},
         {"aten.avg_pool2d.default", op::translate_avg_pool2d},
         {"aten.avg_pool3d.default", op::translate_avg_pool3d},
-        {"aten.baddbmm", op::translate_addmm},
-        {"aten.batch_norm", op::translate_batch_norm},
-        {"aten.bernoulli", op::translate_bernoulli},
+        {"aten.baddbmm.default", op::translate_addmm_fx},
         {"aten.bitwise_and.Scalar", op::translate_bitwise_and},
         {"aten.bitwise_and.Tensor", op::translate_bitwise_and},
         {"aten.bitwise_left_shift.Tensor", op::translate_bitwise_left_shift},
@@ -968,6 +972,7 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_fx() {
         {"aten.isfinite.default", op::translate_1to1_match_1_inputs<opset10::IsFinite>},
         {"aten.isinf.default", op::translate_1to1_match_1_inputs<opset10::IsInf>},
         {"aten.isnan.default", op::translate_1to1_match_1_inputs<opset10::IsNaN>},
+        {"aten.l1_loss.default", op::translate_l1_loss_fx},
         {"aten.le.Scalar", op::translate_1to1_match_2_inputs_align_types<opset10::LessEqual>},
         {"aten.le.Tensor", op::translate_1to1_match_2_inputs_align_types<opset10::LessEqual>},
         {"aten.leaky_relu.default", op::translate_leaky_relu_fx},
@@ -1059,7 +1064,6 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_fx() {
         {"aten.slice_copy.Tensor", op::translate_slice_fx},
         {"aten.slice_scatter.default", op::translate_slice_scatter_fx},
         {"aten.smooth_l1_loss.default", op::translate_smooth_l1_loss_fx},
-        {"aten.l1_loss.default", op::translate_l1_loss_fx},
         {"aten.sort.default", op::translate_sort_fx},
         {"aten.split.Tensor", op::translate_chunk_fx},
         {"aten.split_with_sizes.default", op::translate_split_with_sizes},
@@ -1116,7 +1120,6 @@ const std::unordered_map<std::string, CreatorFunction> get_supported_ops_fx() {
         {"quantized_decomposed.dequantize_per_tensor.default", op::skip_node},
         {"quantized_decomposed.dequantize_per_channel.default", op::skip_node},
         {"inlined.constant.default", op::translate_constant},  // this is a custom ov type
-
     };
 };
 

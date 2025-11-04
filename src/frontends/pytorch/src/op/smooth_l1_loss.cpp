@@ -50,27 +50,26 @@ OutputVector translate_smooth_l1_loss(const NodeContext& node) {
     } else {
         float beta_attr = node.get_attribute<float>("beta", 1.0f);
         OPENVINO_ASSERT(beta_attr >= 0.f, "smooth_l1_loss: beta must be non-negative");
-        beta_like = node.mark_node(std::make_shared<v1::ConvertLike>(v0::Constant::create(element::f32, Shape{}, {beta_attr}), a));
+        beta_like = node.mark_node(
+            std::make_shared<v1::ConvertLike>(v0::Constant::create(element::f32, Shape{}, {beta_attr}), a));
     }
 
     // Per-element computation
     auto diff = node.mark_node(std::make_shared<v1::Subtract>(a, b));
     auto l1 = node.mark_node(std::make_shared<v0::Abs>(diff));
-    auto is_small = node.mark_node(std::make_shared<v1::Less>(
-        node.mark_node(std::make_shared<v0::Abs>(beta_like)),
-        eps_like));
+    auto is_small =
+        node.mark_node(std::make_shared<v1::Less>(node.mark_node(std::make_shared<v0::Abs>(beta_like)), eps_like));
 
     // quad = 0.5 * diff^2 / beta
     auto diff_sq = node.mark_node(std::make_shared<v1::Multiply>(diff, diff));
     auto quad_num = node.mark_node(std::make_shared<v1::Multiply>(c05_like, diff_sq));
     auto quad = node.mark_node(std::make_shared<v1::Divide>(quad_num, beta_like));
     // lin = |x| - 0.5 * beta
-    auto lin = node.mark_node(std::make_shared<v1::Subtract>(l1, node.mark_node(std::make_shared<v1::Multiply>(c05_like, beta_like))));
+    auto lin = node.mark_node(
+        std::make_shared<v1::Subtract>(l1, node.mark_node(std::make_shared<v1::Multiply>(c05_like, beta_like))));
 
-    auto elem = node.mark_node(std::make_shared<v1::Select>(
-        node.mark_node(std::make_shared<v1::Less>(l1, beta_like)),
-        quad,
-        lin));
+    auto elem = node.mark_node(
+        std::make_shared<v1::Select>(node.mark_node(std::make_shared<v1::Less>(l1, beta_like)), quad, lin));
     auto safe = node.mark_node(std::make_shared<v1::Select>(is_small, l1, elem));
 
     // Reduction (0/1/2 -> none/mean/sum) or attribute
@@ -101,49 +100,12 @@ OutputVector translate_smooth_l1_loss(const NodeContext& node) {
     }
     auto out = node.mark_node(std::make_shared<v1::ReduceSum>(safe, axes, false));
     out = node.mark_node(std::make_shared<v1::ConvertLike>(out, a));
-    return { out->output(0) };
+    return {out->output(0)};
 }
 
 // FX wrapper
 OutputVector translate_smooth_l1_loss_fx(const NodeContext& node) {
     return translate_smooth_l1_loss(node);
-}
-
-// aten::l1_loss translator (mean/none/sum)
-OutputVector translate_l1_loss(const NodeContext& node) {
-    auto a = node.get_input(0);
-    auto b = node.get_input(1);
-    align_eltwise_input_types(node, a, b);
-
-    // reduction parse
-    auto reduction = std::string{"mean"};
-    if (node.get_input_size() > 2 && !node.input_is_none(2)) {
-        auto red_input = node.get_input(2);
-        if (auto red_const = std::dynamic_pointer_cast<v0::Constant>(red_input.get_node_shared_ptr())) {
-            int64_t red_val = 1;
-            if (red_const->get_element_type().is_integral_number()) {
-                red_val = red_const->cast_vector<int64_t>()[0];
-            }
-            reduction = (red_val == 0) ? "none" : (red_val == 1) ? "mean" : (red_val == 2) ? "sum" : reduction;
-        }
-    } else {
-        reduction = node.get_attribute<std::string>("reduction", "mean");
-    }
-
-    auto abs_diff = node.mark_node(std::make_shared<v0::Abs>(node.mark_node(std::make_shared<v1::Subtract>(a, b))));
-    std::shared_ptr<ov::Node> out = abs_diff;
-    if (reduction == "mean") {
-        out = node.mark_node(std::make_shared<v1::ReduceMean>(out, get_axes_range(node, 0), false));
-    } else if (reduction == "sum") {
-        out = node.mark_node(std::make_shared<v1::ReduceSum>(out, get_axes_range(node, 0), false));
-    }
-    out = node.mark_node(std::make_shared<v1::ConvertLike>(out, a));
-    return {out->output(0)};
-}
-
-// FX wrapper
-OutputVector translate_l1_loss_fx(const NodeContext& node) {
-    return translate_l1_loss(node);
 }
 
 }  // namespace op
