@@ -9,7 +9,3 @@ ov_add_frontend(NAME pytorch
                 LINK_LIBRARIES openvino::util openvino::core::dev)
 
 ov_build_target_faster(openvino_pytorch_frontend PCH)
-
-target_sources(openvino_pytorch_frontend PRIVATE
-    op/l1_loss.cpp
-)
